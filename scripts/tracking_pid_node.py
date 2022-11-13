@@ -1,5 +1,6 @@
 from dynamic_reconfigure.server import Server
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist
+from tracking_pid.msg import states
 from nav_msgs.msg import Odometry
 import numpy as np
 import rospy
@@ -7,20 +8,22 @@ from std_msgs.msg import Bool
 from tf.transformations import euler_from_quaternion
 from tracking_pid.cfg import ParamsConfig
 from visualization_msgs.msg import Marker
+from collections import deque
 
 
-class TrackingPID:
+class TrackingPIDWQueue:
 
     def __init__(self, odom_topic):
         # Node initialization
         rospy.init_node("tracking_pid")
         # Attributes
+        self.prev_linear_vel = 0
+        self.prev_angular_vel = 0
         self.twist = Twist()
         self.need_waypoint = Bool()
         self.need_waypoint.data = True
-        self.init_waypoint_marker()
-        self.odom = np.empty(3)
-        self.waypoint = self.odom[:2].copy()
+        self.odom = np.empty(5)
+        self.waypoint = self.odom[:5].copy()
         self.rotate_lin_vel = 0.2
         self.verbose = True
         self.angular_tolerance = 0.2
@@ -40,9 +43,9 @@ class TrackingPID:
             kp=1.0,
             kd=0.0,
             ki=0.0,
-            min_output=-1.0,
-            max_output=1.0,
-            delta=0.01,
+            min_output=-0.5,
+            max_output=0.5,
+            delta=0.05,
             min_integral=0.0,
             max_integral=0.0,
             name="Linear",
@@ -54,42 +57,22 @@ class TrackingPID:
             self.odom_callback,
         )
         self.sub_waypoint = rospy.Subscriber(
-            "/waypoint",
-            PointStamped,
-            self.waypoint_callback,
+            "/states_to_be_followed",
+            states,
+            self.states_callback,
         )
-        self.sub_rviz_goal = rospy.Subscriber(
-            "/move_base_simple/goal",
-            PoseStamped,
-            self.rviz_goal_callback,
-        )
-        self.pub_waypoint = rospy.Publisher(
-            "/waypoint_marker",
-            Marker,
-            queue_size=1,
-        )
-        self.pub_flag = rospy.Publisher(
-            "/need_waypoint",
-            Bool,
-            queue_size=1,
-        )
+
         self.pub_cmd_vel = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         # Spinning up
         Server(ParamsConfig, self.param_callback)
         rospy.on_shutdown(self.stop)
         rospy.spin()
 
-    def rviz_goal_callback(self, msg):
-        rospy.loginfo(msg)
-        self.waypoint[0] = msg.pose.position.x
-        self.waypoint[1] = msg.pose.position.y
-        self.need_waypoint.data = False
-
     def param_callback(self, config, _):
         self.angular_tolerance = config["angular_tolerance"]
-        self.robot_radius = config["robot_radius"]
+        self.robot_radius = 0.2
         self.rotate_lin_vel = config["rotate_lin_vel"]
-        self.verbose = config["verbose"]
+        self.verbose = False
 
         self.pid_angular.kp = config["angular_kp"]
         self.pid_angular.ki = config["angular_ki"]
@@ -98,7 +81,7 @@ class TrackingPID:
         self.pid_angular.max_integral = config["angular_max_integral"]
         self.pid_angular.min_output = config["angular_min_output"]
         self.pid_angular.max_output = config["angular_max_output"]
-        self.pid_angular.delta = config["angular_delta"]
+        self.pid_angular.delta = 0.01
 
         self.pid_linear.kp = config["linear_kp"]
         self.pid_linear.ki = config["linear_ki"]
@@ -107,26 +90,8 @@ class TrackingPID:
         self.pid_linear.max_integral = config["linear_max_integral"]
         self.pid_linear.min_output = config["linear_min_output"]
         self.pid_linear.max_output = config["linear_max_output"]
-        self.pid_linear.delta = config["linear_delta"]
+        self.pid_linear.delta = 0.05
         return config
-
-    def init_waypoint_marker(self):
-        self.waypoint_marker = Marker()
-        self.waypoint_marker.header.frame_id = "odom"
-        self.waypoint_marker.header.stamp = rospy.Time.now()
-        self.waypoint_marker.type = self.waypoint_marker.SPHERE
-        self.waypoint_marker.action = 0  # add or modify
-        self.waypoint_marker.pose.orientation.x = 0.0
-        self.waypoint_marker.pose.orientation.y = 0.0
-        self.waypoint_marker.pose.orientation.z = 0.0
-        self.waypoint_marker.pose.orientation.w = 1.0
-        self.waypoint_marker.scale.x = 0.2
-        self.waypoint_marker.scale.y = 0.2
-        self.waypoint_marker.scale.z = 0.2
-        self.waypoint_marker.color.r = 1.0
-        self.waypoint_marker.color.g = 0.0
-        self.waypoint_marker.color.b = 0.0
-        self.waypoint_marker.color.a = 1.0
 
     def stop(self):
         self.twist.linear.x = 0.0
@@ -136,6 +101,7 @@ class TrackingPID:
     def odom_callback(self, msg):
         self.odom[0] = msg.pose.pose.position.x
         self.odom[1] = msg.pose.pose.position.y
+
         orientation = msg.pose.pose.orientation
         quaternion = (
             orientation.x,
@@ -144,33 +110,62 @@ class TrackingPID:
             orientation.w,
         )
         self.odom[2] = euler_from_quaternion(quaternion)[2]
+        self.odom[3] = msg.twist.twist.linear.x
+        self.odom[4] = msg.twist.twist.angular.z
         if self.need_waypoint.data:
+            pass
             #  rospy.loginfo("Waiting for new waypoint...")
-            rospy.loginfo(f"x: {self.odom[0]: .2f} | " +
-                          f"y: {self.odom[1]: .2f} | " +
-                          f"θ: {self.odom[2]/np.pi: .2f} π")
+            # rospy.loginfo(f"x: {self.odom[0]: .2f} | " +
+            #              f"y: {self.odom[1]: .2f} | " +
+            #              f"θ: {self.odom[2]/np.pi: .2f} π")
         else:
             self.control()
-        self.pub_flag.publish(self.need_waypoint)
 
-    def waypoint_callback(self, msg):
-        self.waypoint[0] = msg.point.x
-        self.waypoint[1] = msg.point.y
+    def states_callback(self, msg):
+        states = msg.states
+        states = deque(states)
+        self.i = 0
+
+        self.states = states
+
+        state = states.popleft()
+        self.waypoint[0] = state.x
+        self.waypoint[1] = state.y
+        self.waypoint[2] = state.yaw
+        self.waypoint[3] = state.ux
+        self.waypoint[4] = state.utheta
+
+        self.need_waypoint.data = False
+
+    def get_new_waypoint(self):
+        rospy.logerr(f"{self.i}th waypoint ...")
+        self.i += 1
+        state = self.states.popleft()
+        self.waypoint[0] = state.x
+        self.waypoint[1] = state.y
+        self.waypoint[2] = state.yaw
+        self.waypoint[3] = state.ux
+        self.waypoint[4] = state.utheta
         self.need_waypoint.data = False
 
     def control(self):
-        self.waypoint_marker.pose.position.x = self.waypoint[0]
-        self.waypoint_marker.pose.position.y = self.waypoint[1]
-        self.pub_waypoint.publish(self.waypoint_marker)
         x_diff = self.waypoint[0] - self.odom[0]
         y_diff = self.waypoint[1] - self.odom[1]
         dist = np.hypot(y_diff, x_diff)
         yaw = self.odom[2]
-        x_relative = np.cos(yaw) * x_diff + np.sin(yaw) * y_diff
-        y_relative = -np.sin(yaw) * x_diff + np.cos(yaw) * y_diff
-        angular_error = np.arctan2(y_relative, x_relative)
+        x_relative = np.cos(yaw) * x_diff + np.sin(yaw) * \
+            y_diff
+        y_relative = -np.sin(yaw) * x_diff + np.cos(yaw) * \
+            y_diff
+        angular_error = np.arctan2(
+            y_relative, x_relative)
         linear_error = np.tanh(x_relative)
+
+        #angular_error = (self.waypoint[4] - self.prev_angular_vel)
+        #linear_error = self.waypoint[3] - self.prev_linear_vel
+
         rospy.loginfo(f"Distance: {dist:.2f}")
+
         self.twist.angular.z = self.pid_angular.update(
             angular_error,
             self.verbose,
@@ -179,11 +174,18 @@ class TrackingPID:
             linear_error,
             self.verbose,
         )
+
+        self.prev_angular_vel = self.twist.angular.z
+        self.prev_linear_vel = self.twist.linear.x
+
+        rospy.loginfo(
+            f"Linear velocity {self.twist.linear.x} Angular velocity {self.twist.angular.z}")
         if np.abs(angular_error) > self.angular_tolerance:
             self.twist.linear.x = self.rotate_lin_vel
         if dist < self.robot_radius:
             self.need_waypoint.data = True
-            self.stop()
+            self.get_new_waypoint()
+            # self.stop()
         self.pub_cmd_vel.publish(self.twist)
 
 
@@ -244,6 +246,7 @@ class PID:
             self.previous_output - self.delta,
             self.previous_output + self.delta,
         )
+
         self.previous_error = error
         self.previous_time = current_time
         self.previous_output = output
@@ -261,6 +264,7 @@ class PID:
 
 if __name__ == "__main__":
     try:
-        TrackingPID(odom_topic="/odom")
+        # TrackingPIDWQueue(odom_topic="/odometry/filtered")
+        TrackingPIDWQueue(odom_topic="/odom")
     except rospy.ROSInterruptException:
         pass
